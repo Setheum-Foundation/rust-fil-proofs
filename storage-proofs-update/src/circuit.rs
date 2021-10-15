@@ -309,7 +309,11 @@ where
     pub fn blank(pub_params: PublicParams) -> Self {
         let pub_inputs = PublicInputs::empty();
         let priv_inputs = PrivateInputs::<TreeR>::empty(pub_params.sector_nodes);
-        EmptySectorUpdateCircuit { pub_params, pub_inputs, priv_inputs }
+        EmptySectorUpdateCircuit {
+            pub_params,
+            pub_inputs,
+            priv_inputs,
+        }
     }
 }
 
@@ -319,28 +323,31 @@ where
 {
     fn synthesize<CS: ConstraintSystem<Fr>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let EmptySectorUpdateCircuit {
-            pub_params: PublicParams {
-                sector_nodes,
-                challenge_count,
-                challenge_bit_len,
-                partition_count,
-                partition_bit_len,
-                apex_leaf_count,
-                apex_select_bit_len,
-            },
-            pub_inputs: PublicInputs {
-                k_and_h_select,
-                comm_r_old,
-                comm_d_new,
-                comm_r_new,
-            },
-            priv_inputs: PrivateInputs {
-                comm_c,
-                comm_r_last_old,
-                comm_r_last_new,
-                apex_leafs,
-                challenge_proofs,
-            },
+            pub_params:
+                PublicParams {
+                    sector_nodes,
+                    challenge_count,
+                    challenge_bit_len,
+                    partition_count,
+                    partition_bit_len,
+                    apex_leaf_count,
+                    apex_select_bit_len,
+                },
+            pub_inputs:
+                PublicInputs {
+                    k_and_h_select,
+                    comm_r_old,
+                    comm_d_new,
+                    comm_r_new,
+                },
+            priv_inputs:
+                PrivateInputs {
+                    comm_c,
+                    comm_r_last_old,
+                    comm_r_last_new,
+                    apex_leafs,
+                    challenge_proofs,
+                },
         } = self;
 
         validate_tree_r_shape::<TreeR>(sector_nodes);

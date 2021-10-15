@@ -241,7 +241,11 @@ where
                         panic!("failed to generate `proof_r_new` for c_{}={}", i, c)
                     });
 
-                    vanilla::ChallengeProof { proof_r_old, proof_d_new, proof_r_new }
+                    vanilla::ChallengeProof {
+                        proof_r_old,
+                        proof_d_new,
+                        proof_r_new,
+                    }
                 })
                 .collect();
 
