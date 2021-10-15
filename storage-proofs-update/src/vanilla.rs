@@ -8,7 +8,7 @@ use blstrs::Scalar as Fr;
 use ff::Field;
 use filecoin_hashers::{HashFunction, Hasher};
 use fr32::{bytes_into_fr, fr_into_bytes_slice};
-use generic_array::typenum::{Unsigned, U0};
+use generic_array::typenum::Unsigned;
 use log::{info, trace};
 use memmap::{Mmap, MmapMut, MmapOptions};
 use merkletree::{
@@ -907,43 +907,32 @@ where
             })?;
         new_replica_data.flush()?;
 
-        let (configs, replica_config) = split_config_and_replica(
-            tree_r_last_new_config.clone(),
-            new_replica_path.to_path_buf(),
-            base_tree_nodes_count,
-            tree_count,
-        )?;
-
         // Open the new written replica data as a DiskStore.
         let new_replica_store: DiskStore<TreeRDomain> =
             DiskStore::new_from_slice(nodes_count, &new_replica_data[0..])?;
 
-        let mut start = 0;
-        let mut end = base_tree_nodes_count;
+        let prepare_data = |source: &DiskStore<TreeRDomain>,
+                            _data: Option<&mut Data<'_>>,
+                            start: usize,
+                            end: usize|
+         -> Result<Vec<Fr>> {
+            let tree_data = source
+                .read_range(start..end)
+                .expect("failed to read from source");
+            Ok(tree_data.into_par_iter().map(|x| x.into()).collect())
+        };
 
-        for (i, config) in configs.iter().enumerate() {
-            let current_data: Vec<TreeRDomain> = new_replica_store.read_range(start..end)?;
+        // This argument is currently unused by this invocation, but required for the API.
+        let mut unused_data = Data::empty();
 
-            start += base_tree_nodes_count;
-            end += base_tree_nodes_count;
-
-            info!(
-                "building base tree_r_last with CPU {}/{}",
-                i + 1,
-                tree_count
-            );
-            LCTree::<TreeRHasher, TreeR::Arity, U0, U0>::from_par_iter_with_config(
-                current_data,
-                config.clone(),
-            )?;
-        }
-
-        let tree_r_last = create_lc_tree::<
-            LCTree<TreeRHasher, TreeR::Arity, TreeR::SubTreeArity, TreeR::TopTreeArity>,
-        >(
-            tree_r_last_new_config.size.expect("config size failure"),
-            &configs,
-            &replica_config,
+        let tree_r_last = StackedDrg::<TreeR, TreeDHasher>::generate_tree_r_last::<TreeR::Arity>(
+            &mut unused_data,
+            base_tree_nodes_count,
+            tree_count,
+            tree_r_last_new_config,
+            new_replica_path.to_path_buf(),
+            &new_replica_store,
+            Some(prepare_data),
         )?;
 
         let comm_r_last_new = tree_r_last.root();

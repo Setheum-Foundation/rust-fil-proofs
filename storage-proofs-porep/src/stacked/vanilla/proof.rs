@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use bincode::deserialize;
+use blstrs::Scalar as Fr;
 use fdlimit::raise_fd_limit;
 use filecoin_hashers::{poseidon::PoseidonHasher, Domain, HashFunction, Hasher, PoseidonArity};
 use generic_array::typenum::{Unsigned, U0, U11, U2, U8};
@@ -14,7 +15,7 @@ use lazy_static::lazy_static;
 use log::{error, info, trace};
 use merkletree::{
     merkle::{get_merkle_tree_len, is_merkle_tree_size_valid},
-    store::{Store, StoreConfig},
+    store::{DiskStore, Store, StoreConfig},
 };
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
@@ -76,6 +77,14 @@ pub struct LayerState {
     pub config: StoreConfig,
     pub generated: bool,
 }
+
+#[allow(type_alias_bounds)]
+pub type PrepareTreeRDataCallback<Tree: 'static + MerkleTreeTrait> = fn(
+    source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+    data: Option<&mut Data<'_>>,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Fr>>;
 
 impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tree, G> {
     #[allow(clippy::too_many_arguments)]
@@ -488,10 +497,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::sync::mpsc::sync_channel as channel;
         use std::sync::{Arc, RwLock};
 
-        use blstrs::Scalar as Fr;
         use fr32::fr_into_bytes;
         use generic_array::GenericArray;
-        use merkletree::store::DiskStore;
         use neptune::{
             batch_hasher::Batcher,
             column_tree_builder::{ColumnTreeBuilder, ColumnTreeBuilderTrait},
@@ -798,13 +805,14 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     }
 
     #[cfg(any(feature = "cuda", feature = "opencl"))]
-    pub(crate) fn generate_tree_r_last<TreeArity>(
+    pub fn generate_tree_r_last<TreeArity>(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-        labels: &LabelsCache<Tree>,
+        source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+        callback: Option<PrepareTreeRDataCallback<Tree>>,
     ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
         TreeArity: PoseidonArity,
@@ -813,45 +821,150 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         if SETTINGS.use_gpu_tree_builder
             && TypeId::of::<Tree::Hasher>() == TypeId::of::<PoseidonHasher>()
         {
+            let encode_data = match callback {
+                Some(x) => x,
+                None => |source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+                         data: Option<&mut Data<'_>>,
+                         start: usize,
+                         end: usize|
+                 -> Result<Vec<Fr>> {
+                    use fr32::bytes_into_fr;
+
+                    let mut layer_bytes = vec![0u8; (end - start) * std::mem::size_of::<Fr>()];
+                    source
+                        .read_range_into(start, end, &mut layer_bytes)
+                        .expect("failed to read layer bytes");
+
+                    let encoded_data = layer_bytes
+                        .into_par_iter()
+                        .chunks(std::mem::size_of::<Fr>())
+                        .map(|chunk| {
+                            bytes_into_fr(&chunk).expect("Could not create Fr from bytes.")
+                        })
+                        .zip(
+                            data.expect("failed to unwrap data").as_mut()
+                                [(start * NODE_SIZE)..(end * NODE_SIZE)]
+                                .par_chunks_mut(NODE_SIZE),
+                        )
+                        .map(|(key, data_node_bytes)| {
+                            let data_node =
+                                <Tree::Hasher as Hasher>::Domain::try_from_bytes(data_node_bytes)
+                                    .expect("try_from_bytes failed");
+
+                            let encoded_node =
+                                encode::<<Tree::Hasher as Hasher>::Domain>(key.into(), data_node);
+                            data_node_bytes.copy_from_slice(AsRef::<[u8]>::as_ref(&encoded_node));
+
+                            encoded_node
+                        });
+
+                    Ok(encoded_data.into_par_iter().map(|x| x.into()).collect())
+                },
+            };
+
             Self::generate_tree_r_last_gpu::<TreeArity>(
                 data,
                 nodes_count,
                 tree_count,
                 tree_r_last_config,
                 replica_path,
-                labels,
+                source,
+                encode_data,
             )
         } else {
+            let encode_data = match callback {
+                Some(x) => x,
+                None => |source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+                         data: Option<&mut Data<'_>>,
+                         start: usize,
+                         end: usize|
+                 -> Result<Vec<Fr>> {
+                    let encoded_data = source
+                        .read_range(start..end)?
+                        .into_par_iter()
+                        .zip(
+                            data.expect("failed to unwrap data").as_mut()
+                                [(start * NODE_SIZE)..(end * NODE_SIZE)]
+                                .par_chunks_mut(NODE_SIZE),
+                        )
+                        .map(|(key, data_node_bytes)| {
+                            let data_node =
+                                <Tree::Hasher as Hasher>::Domain::try_from_bytes(data_node_bytes)
+                                    .expect("try from bytes failed");
+                            let encoded_node =
+                                encode::<<Tree::Hasher as Hasher>::Domain>(key, data_node);
+                            data_node_bytes.copy_from_slice(AsRef::<[u8]>::as_ref(&encoded_node));
+
+                            encoded_node
+                        });
+
+                    Ok(encoded_data.into_par_iter().map(|x| x.into()).collect())
+                },
+            };
+
             Self::generate_tree_r_last_cpu::<TreeArity>(
                 data,
                 nodes_count,
                 tree_count,
                 tree_r_last_config,
                 replica_path,
-                labels,
+                source,
+                encode_data,
             )
         }
     }
 
     #[cfg(not(any(feature = "cuda", feature = "opencl")))]
-    fn generate_tree_r_last<TreeArity>(
+    pub fn generate_tree_r_last<TreeArity>(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-        labels: &LabelsCache<Tree>,
+        source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+        callback: Option<PrepareTreeRDataCallback<Tree>>,
     ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
         TreeArity: PoseidonArity,
     {
+        let encode_data = match callback {
+            Some(x) => x,
+            None => |source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+                     data: Option<&mut Data<'_>>,
+                     start: usize,
+                     end: usize|
+             -> Result<Vec<Fr>> {
+                let encoded_data = source
+                    .read_range(start..end)?
+                    .into_par_iter()
+                    .zip(
+                        data.expect("failed to unwrap data").as_mut()
+                            [(start * NODE_SIZE)..(end * NODE_SIZE)]
+                            .par_chunks_mut(NODE_SIZE),
+                    )
+                    .map(|(key, data_node_bytes)| {
+                        let data_node =
+                            <Tree::Hasher as Hasher>::Domain::try_from_bytes(data_node_bytes)
+                                .expect("try from bytes failed");
+                        let encoded_node =
+                            encode::<<Tree::Hasher as Hasher>::Domain>(key, data_node);
+                        data_node_bytes.copy_from_slice(AsRef::<[u8]>::as_ref(&encoded_node));
+
+                        encoded_node
+                    });
+
+                Ok(encoded_data.into_par_iter().map(|x| x.into()).collect())
+            },
+        };
+
         Self::generate_tree_r_last_cpu::<TreeArity>(
             data,
             nodes_count,
             tree_count,
             tree_r_last_config,
             replica_path,
-            labels,
+            source,
+            encode_data,
         )
     }
 
@@ -862,7 +975,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-        labels: &LabelsCache<Tree>,
+        source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+        callback: PrepareTreeRDataCallback<Tree>,
     ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
         TreeArity: PoseidonArity,
@@ -872,7 +986,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::io::Write;
         use std::sync::mpsc::sync_channel as channel;
 
-        use blstrs::Scalar as Fr;
         use fr32::fr_into_bytes;
         use merkletree::merkle::{get_merkle_tree_cache_size, get_merkle_tree_leafs};
         use neptune::{
@@ -886,9 +999,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             nodes_count,
             tree_count,
         )?;
-
-        data.ensure_data()?;
-        let last_layer_labels = labels.labels_for_last_layer()?;
 
         info!("generating tree r last using the GPU");
         let max_gpu_tree_batch_size = SETTINGS.max_gpu_tree_batch_size as usize;
@@ -922,44 +1032,10 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             end,
                         );
 
-                        let encoded_data = {
-                            use fr32::bytes_into_fr;
-
-                            let mut layer_bytes =
-                                vec![0u8; (end - start) * std::mem::size_of::<Fr>()];
-                            last_layer_labels
-                                .read_range_into(start, end, &mut layer_bytes)
-                                .expect("failed to read layer bytes");
-
-                            layer_bytes
-                                .into_par_iter()
-                                .chunks(std::mem::size_of::<Fr>())
-                                .map(|chunk| {
-                                    bytes_into_fr(&chunk).expect("Could not create Fr from bytes.")
-                                })
-                                .zip(
-                                    data.as_mut()[(start * NODE_SIZE)..(end * NODE_SIZE)]
-                                        .par_chunks_mut(NODE_SIZE),
-                                )
-                                .map(|(key, data_node_bytes)| {
-                                    let data_node =
-                                        <Tree::Hasher as Hasher>::Domain::try_from_bytes(
-                                            data_node_bytes,
-                                        )
-                                        .expect("try_from_bytes failed");
-
-                                    let encoded_node = encode::<<Tree::Hasher as Hasher>::Domain>(
-                                        key.into(),
-                                        data_node,
-                                    );
-                                    data_node_bytes
-                                        .copy_from_slice(AsRef::<[u8]>::as_ref(&encoded_node));
-
-                                    encoded_node
-                                })
-                        };
-
+                        let prepared_data: Vec<Fr> = callback(&source, Some(data), start, end)
+                            .expect("failed to prepare tree_r_last data");
                         node_index += chunked_nodes_count;
+
                         trace!(
                             "node index {}/{}/{}",
                             node_index,
@@ -967,13 +1043,10 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             nodes_count,
                         );
 
-                        let encoded: Vec<_> =
-                            encoded_data.into_par_iter().map(|x| x.into()).collect();
-
                         let is_final = node_index == nodes_count;
                         builder_tx
-                            .send((encoded, is_final))
-                            .expect("failed to send encoded");
+                            .send((prepared_data, is_final))
+                            .expect("failed to send prepared data");
                     }
                 }
             });
@@ -993,13 +1066,13 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 // Loop until all trees for all configs have been built.
                 for i in 0..config_count {
                     loop {
-                        let (encoded, is_final) =
-                            builder_rx.recv().expect("failed to recv encoded data");
+                        let (prepared_data, is_final) =
+                            builder_rx.recv().expect("failed to recv prepared data");
 
                         // Just add non-final leaf batches.
                         if !is_final {
                             tree_builder
-                                .add_leaves(&encoded)
+                                .add_leaves(&prepared_data)
                                 .expect("failed to add leaves");
                             continue;
                         };
@@ -1011,7 +1084,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             tree_count
                         );
                         let (_, tree_data) = tree_builder
-                            .add_final_leaves(&encoded)
+                            .add_final_leaves(&prepared_data)
                             .expect("failed to add final leaves");
 
                         writer_tx.send(tree_data).expect("failed to send tree_data");
@@ -1074,7 +1147,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-        labels: &LabelsCache<Tree>,
+        source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+        callback: PrepareTreeRDataCallback<Tree>,
     ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
         TreeArity: PoseidonArity,
@@ -1086,31 +1160,17 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             tree_count,
         )?;
 
-        data.ensure_data()?;
-        let last_layer_labels = labels.labels_for_last_layer()?;
-
         info!("generating tree r last using the CPU");
-        let size = Store::len(last_layer_labels);
+        let size = Store::len(source);
 
         let mut start = 0;
         let mut end = size / tree_count;
 
         for (i, config) in configs.iter().enumerate() {
-            let encoded_data = last_layer_labels
-                .read_range(start..end)?
-                .into_par_iter()
-                .zip(
-                    data.as_mut()[(start * NODE_SIZE)..(end * NODE_SIZE)].par_chunks_mut(NODE_SIZE),
-                )
-                .map(|(key, data_node_bytes)| {
-                    let data_node =
-                        <Tree::Hasher as Hasher>::Domain::try_from_bytes(data_node_bytes)
-                            .expect("try from bytes failed");
-                    let encoded_node = encode::<<Tree::Hasher as Hasher>::Domain>(key, data_node);
-                    data_node_bytes.copy_from_slice(AsRef::<[u8]>::as_ref(&encoded_node));
+            let encoded_data = callback(&source, Some(data), start, end)
+                .expect("failed to prepare tree_r_last data");
 
-                    encoded_node
-                });
+            let encoded_data: Vec<_> = encoded_data.into_par_iter().map(|x| x.into()).collect();
 
             info!(
                 "building base tree_r_last with CPU {}/{}",
@@ -1320,6 +1380,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         drop(tree_d);
 
         // Encode original data into the last layer.
+        let last_layer_labels = labels.labels_for_last_layer()?;
+        data.ensure_data()?;
+
         info!("building tree_r_last");
         let tree_r_last = measure_op(Operation::GenerateTreeRLast, || {
             Self::generate_tree_r_last::<Tree::Arity>(
@@ -1328,7 +1391,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 tree_count,
                 tree_r_last_config.clone(),
                 replica_path.clone(),
-                &labels,
+                &last_layer_labels,
+                None,
             )
             .context("failed to generate tree_r_last")
         })?;
@@ -1422,7 +1486,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::fs::OpenOptions;
         use std::io::Write;
 
-        use blstrs::Scalar as Fr;
         use ff::Field;
         use fr32::fr_into_bytes;
         use merkletree::merkle::{get_merkle_tree_cache_size, get_merkle_tree_leafs};
